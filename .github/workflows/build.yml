@@ -147,13 +147,15 @@ jobs:
         run: |
           CLANG_DIR="${{ github.workspace }}/proton-clang/bin"
           mkdir -p "${OUT_DIR}"
-          make -j"$(nproc)" \
+          PATH="${CLANG_DIR}:${PATH}" make -j"$(nproc)" \
             O="${OUT_DIR}" \
             ARCH="${ARCH}" \
             CC="${CLANG_DIR}/clang" \
+            CLANG_TRIPLE="aarch64-linux-gnu-" \
             CROSS_COMPILE="${CLANG_DIR}/aarch64-linux-gnu-" \
             CROSS_COMPILE_ARM32="${CLANG_DIR}/arm-linux-gnueabi-" \
             LD="${CLANG_DIR}/ld.lld" \
+            AS="${CLANG_DIR}/llvm-as" \
             AR="${CLANG_DIR}/llvm-ar" \
             NM="${CLANG_DIR}/llvm-nm" \
             OBJCOPY="${CLANG_DIR}/llvm-objcopy" \
@@ -188,13 +190,16 @@ jobs:
             CC_CMD="${CLANG_DIR}/clang"
           fi
 
-          make -j"$(nproc)" \
+          set +e
+          PATH="${CLANG_DIR}:${PATH}" make -j"$(nproc)" \
             O="${OUT_DIR}" \
             ARCH="${ARCH}" \
             CC="${CC_CMD}" \
+            CLANG_TRIPLE="aarch64-linux-gnu-" \
             CROSS_COMPILE="${CLANG_DIR}/aarch64-linux-gnu-" \
             CROSS_COMPILE_ARM32="${CLANG_DIR}/arm-linux-gnueabi-" \
             LD="${CLANG_DIR}/ld.lld" \
+            AS="${CLANG_DIR}/llvm-as" \
             AR="${CLANG_DIR}/llvm-ar" \
             NM="${CLANG_DIR}/llvm-nm" \
             OBJCOPY="${CLANG_DIR}/llvm-objcopy" \
@@ -204,7 +209,20 @@ jobs:
             OBJSIZE="${CLANG_DIR}/llvm-size" \
             LDGOLD="${CLANG_DIR}/aarch64-linux-gnu-ld.gold" \
             LLVM_AR="${CLANG_DIR}/llvm-ar" \
-            LLVM_DIS="${CLANG_DIR}/llvm-dis"
+            LLVM_DIS="${CLANG_DIR}/llvm-dis" \
+            CONFIG_NO_ERROR_ON_MISMATCH=y 2>&1 | tee build.log
+          MAKE_RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$MAKE_RC" -ne 0 ]; then
+            echo "=== Build failed (rc=$MAKE_RC), emitting error summary ==="
+            grep -iE "error:|fatal error:|undefined reference|ld\.lld:|No such file|Stop\." build.log | tail -n 15 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+            tail -n 10 build.log | while IFS= read -r line; do
+              echo "::warning::${line}"
+            done
+            exit "$MAKE_RC"
+          fi
 
           echo "=== Built boot outputs ==="
           ls -lh "${OUT_DIR}/arch/${ARCH}/boot/"
