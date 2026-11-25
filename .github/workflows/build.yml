@@ -45,6 +45,8 @@ jobs:
   build:
     name: 编译 chopin 4.14.186 + SukiSU-Nova
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     container:
       image: ubuntu:22.04
     outputs:
@@ -210,13 +212,21 @@ jobs:
           tail -n 120 build.log
           if [ "$MAKE_RC" -ne 0 ]; then
             {
-              echo "### Build Failed (exit code $MAKE_RC)"
-              echo '```text'
-              grep -iE "error:|fatal error:|undefined reference|ld\.lld:|No such file|Stop\." build.log | tail -n 50 || true
-              echo "--- LAST 50 LINES ---"
-              tail -n 50 build.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+              echo "=== Build Failed (exit code $MAKE_RC) ==="
+              echo "=== GREP ERRORS ==="
+              grep -n -iE "error:|fatal error:|undefined reference|ld\.lld:|No such file|Stop\.|kernelsu" build.log | tail -n 120 || true
+              echo "=== LAST 150 LINES ==="
+              tail -n 150 build.log
+            } > "${{ github.workspace }}/build_error.txt"
+
+            mkdir -p /tmp/logrepo && cd /tmp/logrepo
+            git init -b build-logs
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            cp "${{ github.workspace }}/build_error.txt" ./build_error.txt
+            git add build_error.txt
+            git commit -m "Build error log (${{ github.run_id }})"
+            git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" build-logs:build-logs
             exit "$MAKE_RC"
           fi
 
