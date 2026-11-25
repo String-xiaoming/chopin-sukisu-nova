@@ -1,0 +1,291 @@
+name: Build Chopin 4.14 SukiSU-Nova Kernel
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      spoof_stock_version:
+        description: '伪装为原厂 V14.0.8.0.TKPCNXM 内核版本字符串'
+        required: true
+        type: boolean
+        default: true
+      enable_hostsredirect:
+        description: '启用 SukiSU 内核级 hosts 重定向 (CONFIG_KSU_HOSTSREDIRECT)'
+        required: true
+        type: boolean
+        default: true
+      ccache_enabled:
+        description: '启用 ccache 加速二次编译'
+        required: true
+        type: boolean
+        default: true
+      publish_release:
+        description: '构建完成后自动发布到 GitHub Releases'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  TZ: Asia/Shanghai
+  KERNEL_REPO: https://github.com/ChopinKernels/android_kernel_chopin_android_T.git
+  KERNEL_BRANCH: T
+  DEFCONFIG: chopin_user_defconfig
+  SUKISU_REPO: https://github.com/SukiSU-Nova/SukiSU-Nova.git
+  SUKISU_BRANCH: builtin-new
+  CLANG_REPO: https://github.com/kdrag0n/proton-clang.git
+  CLANG_BRANCH: master
+  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
+  ANYKERNEL_BRANCH: master
+  ARCH: arm64
+  OUT_DIR: ${{ github.workspace }}/out
+
+jobs:
+  build:
+    name: 编译 chopin 4.14.186 + SukiSU-Nova
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:22.04
+    outputs:
+      build_tag: ${{ steps.meta.outputs.build_tag }}
+      ak3_zip: ${{ steps.pack.outputs.ak3_zip }}
+      ksu_ver: ${{ steps.ksu_info.outputs.ksu_ver }}
+
+    steps:
+      - name: 1. 初始化构建环境 (Ubuntu 22.04 容器)
+        id: meta
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl wget git zip unzip zstd \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libfl-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            python2 python3 ccache cpio kmod xz-utils
+          ln -sf /usr/bin/python2 /usr/local/bin/python
+          git config --global --add safe.directory '*'
+          echo "build_tag=$(date +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
+      - name: 2. 克隆 chopin MIUI 14 (Android 13 / T) 4.14.186 内核源码
+        run: |
+          git clone --depth=1 --single-branch -b "${KERNEL_BRANCH}" "${KERNEL_REPO}" kernel_src
+          head -n 6 kernel_src/Makefile
+
+      - name: 3. 克隆 Proton Clang 工具链
+        run: |
+          git clone --depth=1 --single-branch -b "${CLANG_BRANCH}" "${CLANG_REPO}" proton-clang
+          echo "${{ github.workspace }}/proton-clang/bin" >> "$GITHUB_PATH"
+          ./proton-clang/bin/clang --version
+
+      - name: 4. 恢复 ccache 缓存
+        if: ${{ github.event_name == 'push' || inputs.ccache_enabled }}
+        uses: actions/cache@v4
+        with:
+          path: /root/.ccache
+          key: ccache-chopin-t-sukisu-nova-${{ github.sha }}
+          restore-keys: |
+            ccache-chopin-t-sukisu-nova-
+
+      - name: 5. 集成 SukiSU-Nova (builtin-new / Syscall Table Hook)
+        id: ksu_info
+        working-directory: kernel_src
+        run: |
+          rm -rf KernelSU drivers/kernelsu
+          git clone --single-branch -b "${SUKISU_BRANCH}" "${SUKISU_REPO}" KernelSU
+          KSU_SHA=$(git -C KernelSU rev-parse --short=8 HEAD)
+          echo "ksu_ver=builtin-new-${KSU_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Cloned SukiSU-Nova (${SUKISU_BRANCH}) @ ${KSU_SHA}"
+
+          ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
+          grep -q 'kernelsu' drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          DEF="arch/${ARCH}/configs/${DEFCONFIG}"
+          cat << 'EOF' >> "$DEF"
+
+          # === SukiSU-Nova (builtin-new) for Non-GKI 4.14 ===
+          CONFIG_KSU=y
+          CONFIG_KSU_TAMPER_SYSCALL_TABLE=y
+          CONFIG_KSU_LSM_SECURITY_HOOKS=y
+          CONFIG_KSU_FEATURE_ADBROOT=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          # CONFIG_KPROBES is not set
+          # CONFIG_KSU_SUSFS is not set
+          # CONFIG_KSU_HACK_ARM64_BRANCH_LINK is not set
+          EOF
+
+          if [ "${{ github.event_name == 'push' || inputs.enable_hostsredirect }}" = "true" ]; then
+            echo "CONFIG_KSU_HOSTSREDIRECT=y" >> "$DEF"
+          fi
+
+          tail -n 20 "$DEF"
+
+      - name: 6. 伪装原厂 V14.0.8.0.TKPCNXM 内核版本字符串
+        if: ${{ github.event_name == 'push' || inputs.spoof_stock_version }}
+        working-directory: kernel_src
+        run: |
+          sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION = -gaa24d707761c/' Makefile
+          sed -i '2i exit 0' scripts/setlocalversion
+          STOCK_CC='Android (6443078 based on r383902) clang version 11.0.1 (https://android.googlesource.com/toolchain/llvm-project b397f81060ce6d701042b782172ed13bee898b79), LLD 11.0.1 (/buildbot/tmp/tmp6_m7QH b397f81060ce6d701042b782172ed13bee898b79)'
+          python3 - "$STOCK_CC" << 'PY'
+          import sys
+          from pathlib import Path
+          p = Path("scripts/mkcompile_h")
+          txt = p.read_text(encoding="utf-8")
+          old = 'printf \'#define LINUX_COMPILER "%s"\\n\' "$CC_VERSION, $LD_VERSION"'
+          new = f'printf \'#define LINUX_COMPILER "%s"\\n\' "{sys.argv[1]}"'
+          assert old in txt, "LINUX_COMPILER line not found in scripts/mkcompile_h"
+          p.write_text(txt.replace(old, new, 1), encoding="utf-8")
+          print("Successfully patched scripts/mkcompile_h")
+          PY
+
+      - name: 7. 生成 .config 并核对 SukiSU-Nova 配置生效
+        working-directory: kernel_src
+        run: |
+          CLANG_DIR="${{ github.workspace }}/proton-clang/bin"
+          mkdir -p "${OUT_DIR}"
+          make -j"$(nproc)" \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            CC="${CLANG_DIR}/clang" \
+            CROSS_COMPILE="${CLANG_DIR}/aarch64-linux-gnu-" \
+            CROSS_COMPILE_ARM32="${CLANG_DIR}/arm-linux-gnueabi-" \
+            LD="${CLANG_DIR}/ld.lld" \
+            AR="${CLANG_DIR}/llvm-ar" \
+            NM="${CLANG_DIR}/llvm-nm" \
+            OBJCOPY="${CLANG_DIR}/llvm-objcopy" \
+            OBJDUMP="${CLANG_DIR}/llvm-objdump" \
+            READELF="${CLANG_DIR}/llvm-readelf" \
+            STRIP="${CLANG_DIR}/llvm-strip" \
+            OBJSIZE="${CLANG_DIR}/llvm-size" \
+            LDGOLD="${CLANG_DIR}/aarch64-linux-gnu-ld.gold" \
+            LLVM_AR="${CLANG_DIR}/llvm-ar" \
+            LLVM_DIS="${CLANG_DIR}/llvm-dis" \
+            "${DEFCONFIG}"
+
+          echo "=== Verified KSU / KALLSYMS options in out/.config ==="
+          grep -E "^(# )?(CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KPROBES|CONFIG_OVERLAY_FS)" "${OUT_DIR}/.config"
+          grep -q "^CONFIG_KSU=y$" "${OUT_DIR}/.config"
+          grep -q "^CONFIG_KSU_TAMPER_SYSCALL_TABLE=y$" "${OUT_DIR}/.config"
+          grep -q "^CONFIG_KALLSYMS_ALL=y$" "${OUT_DIR}/.config"
+
+      - name: 8. 编译内核 (4.14.186 + SukiSU-Nova)
+        working-directory: kernel_src
+        env:
+          KBUILD_BUILD_USER: builder
+          KBUILD_BUILD_HOST: pangu-build-component-vendor-176809-mjwkw-h4m64-542cj
+          KBUILD_BUILD_TIMESTAMP: "Thu Nov 2 16:13:34 UTC 2023"
+          KBUILD_BUILD_VERSION: "1"
+        run: |
+          CLANG_DIR="${{ github.workspace }}/proton-clang/bin"
+          if [ "${{ github.event_name == 'push' || inputs.ccache_enabled }}" = "true" ]; then
+            ccache -o compression=false -o cache_dir=/root/.ccache -M 4G
+            CC_CMD="ccache ${CLANG_DIR}/clang"
+          else
+            CC_CMD="${CLANG_DIR}/clang"
+          fi
+
+          make -j"$(nproc)" \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            CC="${CC_CMD}" \
+            CROSS_COMPILE="${CLANG_DIR}/aarch64-linux-gnu-" \
+            CROSS_COMPILE_ARM32="${CLANG_DIR}/arm-linux-gnueabi-" \
+            LD="${CLANG_DIR}/ld.lld" \
+            AR="${CLANG_DIR}/llvm-ar" \
+            NM="${CLANG_DIR}/llvm-nm" \
+            OBJCOPY="${CLANG_DIR}/llvm-objcopy" \
+            OBJDUMP="${CLANG_DIR}/llvm-objdump" \
+            READELF="${CLANG_DIR}/llvm-readelf" \
+            STRIP="${CLANG_DIR}/llvm-strip" \
+            OBJSIZE="${CLANG_DIR}/llvm-size" \
+            LDGOLD="${CLANG_DIR}/aarch64-linux-gnu-ld.gold" \
+            LLVM_AR="${CLANG_DIR}/llvm-ar" \
+            LLVM_DIS="${CLANG_DIR}/llvm-dis"
+
+          echo "=== Built boot outputs ==="
+          ls -lh "${OUT_DIR}/arch/${ARCH}/boot/"
+          ls -lh "${OUT_DIR}/arch/${ARCH}/boot/dts/mediatek/" || true
+          echo "=== Kernel banner check ==="
+          strings "${OUT_DIR}/arch/${ARCH}/boot/Image" | grep -m 2 "Linux version 4.14" || true
+          strings "${OUT_DIR}/arch/${ARCH}/boot/Image" | grep -m 3 "com.sukisu.nova" || true
+
+      - name: 9. 打包 AnyKernel3 与构建产物
+        id: pack
+        run: |
+          BOOT_DIR="${OUT_DIR}/arch/${ARCH}/boot"
+          mkdir -p artifacts_out
+
+          if [ ! -f "${BOOT_DIR}/Image.gz" ] && [ -f "${BOOT_DIR}/Image" ]; then
+            gzip -9 -c "${BOOT_DIR}/Image" > "${BOOT_DIR}/Image.gz"
+          fi
+
+          test -f "${BOOT_DIR}/Image.gz"
+          cp -f "${BOOT_DIR}/Image.gz" artifacts_out/Image.gz
+          cp -f "${BOOT_DIR}/Image" artifacts_out/Image
+          cp -f "${OUT_DIR}/.config" artifacts_out/kernel_built.config
+          [ -f "${BOOT_DIR}/Image.gz-dtb" ] && cp -f "${BOOT_DIR}/Image.gz-dtb" artifacts_out/
+          [ -f "${BOOT_DIR}/dts/mediatek/chopin.dtb" ] && cp -f "${BOOT_DIR}/dts/mediatek/chopin.dtb" artifacts_out/
+          [ -f "${BOOT_DIR}/dtbo.img" ] && cp -f "${BOOT_DIR}/dtbo.img" artifacts_out/
+
+          git clone --depth=1 -b "${ANYKERNEL_BRANCH}" "${ANYKERNEL_REPO}" AnyKernel3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+          sed -i 's!block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!block=auto;!g' AnyKernel3/anykernel.sh
+          sed -i 's/is_slot_device=1;/is_slot_device=auto;/g' AnyKernel3/anykernel.sh
+          cp -f "${BOOT_DIR}/Image.gz" AnyKernel3/Image.gz
+
+          AK3_NAME="AnyKernel3-chopin-4.14.186-SukiSU-Nova-${{ steps.meta.outputs.build_tag }}.zip"
+          (cd AnyKernel3 && zip -q -r9 "${{ github.workspace }}/artifacts_out/${AK3_NAME}" . -x '.git/*' 'README.md')
+          echo "ak3_zip=${AK3_NAME}" >> "$GITHUB_OUTPUT"
+
+          (cd artifacts_out && sha256sum * > SHA256SUMS.txt)
+          ls -lh artifacts_out/
+
+      - name: 10. 上传构建产物 (Actions Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: chopin-sukisu-nova-${{ steps.meta.outputs.build_tag }}
+          path: artifacts_out/*
+          retention-days: 14
+
+  release:
+    name: 发布到 GitHub Releases
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.publish_release }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: chopin-sukisu-nova-${{ needs.build.outputs.build_tag }}
+          path: ./release_assets
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="chopin-sukisu-nova-${{ needs.build.outputs.build_tag }}"
+          cat << 'EOF' > notes.md
+          ### Redmi Note 10 Pro 5G (chopin) MIUI 14 内核云编译产物
+
+          - **目标机型**：Redmi Note 10 Pro 5G (\`chopin\`, MT6891/MT6893)
+          - **目标固件**：MIUI 14 \`V14.0.8.0.TKPCNXM\` (Android 13 / T)
+          - **内核源码**：\`ChopinKernels/android_kernel_chopin_android_T\` (\`T\` 分支，Linux \`4.14.186\`)
+          - **内核级 Root**：\`SukiSU-Nova/SukiSU-Nova\` (\`${{ needs.build.outputs.ksu_ver }}\`)
+          - **Hook 模式**：\`CONFIG_KSU_TAMPER_SYSCALL_TABLE=y\` + \`CONFIG_KSU_LSM_SECURITY_HOOKS=y\`（专用于 3.0~4.14 非 GKI，无需 Kprobes）
+          - **配套管理器**：\`com.sukisu.nova\`（SukiSU-Nova 官方管理器）
+          - **关键配置**：已启用 \`CONFIG_KALLSYMS_ALL=y\`、\`CONFIG_KSU_FEATURE_ADBROOT=y\`、内置 \`mount_hide\` / \`selinux_hide\` / \`avc_spoof\` / \`kernel_umount\` / 音量键三连安全模式
+
+          > 推荐用 \`Image.gz\` 替换原厂 \`boot.img\` 中的 kernel 重打包后，通过 Fastboot 刷入当前激活槽位（先用 \`fastboot getvar current-slot\` 确认是 \`a\` 还是 \`b\`）。
+          EOF
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "chopin 4.14.186 SukiSU-Nova (${{ needs.build.outputs.build_tag }})" \
+            --notes-file notes.md \
+            ./release_assets/*
