@@ -39,7 +39,6 @@ env:
   ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
   ANYKERNEL_BRANCH: master
   ARCH: arm64
-  OUT_DIR: ${{ github.workspace }}/out
 
 jobs:
   build:
@@ -68,6 +67,8 @@ jobs:
             python2 python3 ccache cpio kmod xz-utils
           ln -sf /usr/bin/python2 /usr/local/bin/python
           git config --global --add safe.directory '*'
+          echo "OUT_DIR=${GITHUB_WORKSPACE}/out" >> "$GITHUB_ENV"
+          echo "CLANG_DIR=${GITHUB_WORKSPACE}/proton-clang/bin" >> "$GITHUB_ENV"
           echo "build_tag=$(date +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
 
       - name: 2. 克隆 chopin MIUI 14 (Android 13 / T) 4.14.186 内核源码
@@ -78,8 +79,8 @@ jobs:
       - name: 3. 克隆 Proton Clang 工具链
         run: |
           git clone --depth=1 --single-branch -b "${CLANG_BRANCH}" "${CLANG_REPO}" proton-clang
-          echo "${{ github.workspace }}/proton-clang/bin" >> "$GITHUB_PATH"
-          ./proton-clang/bin/clang --version
+          echo "${GITHUB_WORKSPACE}/proton-clang/bin" >> "$GITHUB_PATH"
+          "${CLANG_DIR}/clang" --version
 
       - name: 4. 恢复 ccache 缓存
         if: ${{ github.event_name == 'push' || inputs.ccache_enabled }}
@@ -148,7 +149,6 @@ jobs:
         shell: bash
         working-directory: kernel_src
         run: |
-          CLANG_DIR="${{ github.workspace }}/proton-clang/bin"
           mkdir -p "${OUT_DIR}"
           PATH="${CLANG_DIR}:${PATH}" make -j"$(nproc)" \
             O="${OUT_DIR}" \
@@ -185,8 +185,12 @@ jobs:
           KBUILD_BUILD_TIMESTAMP: "Thu Nov 2 16:13:34 UTC 2023"
           KBUILD_BUILD_VERSION: "1"
         run: |
-          CLANG_DIR="${{ github.workspace }}/proton-clang/bin"
-          CC_CMD="${CLANG_DIR}/clang"
+          if [ "${{ github.event_name == 'push' || inputs.ccache_enabled }}" = "true" ]; then
+            ccache -o compression=false -o cache_dir=/root/.ccache -M 4G
+            CC_CMD="ccache ${CLANG_DIR}/clang"
+          else
+            CC_CMD="${CLANG_DIR}/clang"
+          fi
 
           MAKE_RC=0
           PATH="${CLANG_DIR}:${PATH}" make -j"$(nproc)" \
@@ -217,13 +221,13 @@ jobs:
               grep -n -iE "error:|fatal error:|undefined reference|ld\.lld:|No such file|Stop\.|kernelsu" build.log | tail -n 120 || true
               echo "=== LAST 150 LINES ==="
               tail -n 150 build.log
-            } > "${{ github.workspace }}/build_error.txt"
+            } > "${GITHUB_WORKSPACE}/build_error.txt"
 
             mkdir -p /tmp/logrepo && cd /tmp/logrepo
             git init -b build-logs
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            cp "${{ github.workspace }}/build_error.txt" ./build_error.txt
+            cp "${GITHUB_WORKSPACE}/build_error.txt" ./build_error.txt
             git add build_error.txt
             git commit -m "Build error log (${{ github.run_id }})"
             git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" build-logs:build-logs
@@ -262,7 +266,7 @@ jobs:
           cp -f "${BOOT_DIR}/Image.gz" AnyKernel3/Image.gz
 
           AK3_NAME="AnyKernel3-chopin-4.14.186-SukiSU-Nova-${{ steps.meta.outputs.build_tag }}.zip"
-          (cd AnyKernel3 && zip -q -r9 "${{ github.workspace }}/artifacts_out/${AK3_NAME}" . -x '.git/*' 'README.md')
+          (cd AnyKernel3 && zip -q -r9 "${GITHUB_WORKSPACE}/artifacts_out/${AK3_NAME}" . -x '.git/*' 'README.md')
           echo "ak3_zip=${AK3_NAME}" >> "$GITHUB_OUTPUT"
 
           (cd artifacts_out && sha256sum * > SHA256SUMS.txt)
@@ -297,15 +301,15 @@ jobs:
           cat << 'EOF' > notes.md
           ### Redmi Note 10 Pro 5G (chopin) MIUI 14 内核云编译产物
 
-          - **目标机型**：Redmi Note 10 Pro 5G (\`chopin\`, MT6891/MT6893)
-          - **目标固件**：MIUI 14 \`V14.0.8.0.TKPCNXM\` (Android 13 / T)
-          - **内核源码**：\`ChopinKernels/android_kernel_chopin_android_T\` (\`T\` 分支，Linux \`4.14.186\`)
-          - **内核级 Root**：\`SukiSU-Nova/SukiSU-Nova\` (\`${{ needs.build.outputs.ksu_ver }}\`)
-          - **Hook 模式**：\`CONFIG_KSU_TAMPER_SYSCALL_TABLE=y\` + \`CONFIG_KSU_LSM_SECURITY_HOOKS=y\`（专用于 3.0~4.14 非 GKI，无需 Kprobes）
-          - **配套管理器**：\`com.sukisu.nova\`（SukiSU-Nova 官方管理器）
-          - **关键配置**：已启用 \`CONFIG_KALLSYMS_ALL=y\`、\`CONFIG_KSU_FEATURE_ADBROOT=y\`、内置 \`mount_hide\` / \`selinux_hide\` / \`avc_spoof\` / \`kernel_umount\` / 音量键三连安全模式
+          - **目标机型**：Redmi Note 10 Pro 5G (`chopin`, MT6891/MT6893)
+          - **目标固件**：MIUI 14 `V14.0.8.0.TKPCNXM` (Android 13 / T)
+          - **内核源码**：`ChopinKernels/android_kernel_chopin_android_T` (`T` 分支，Linux `4.14.186`)
+          - **内核级 Root**：`SukiSU-Nova/SukiSU-Nova` (`${{ needs.build.outputs.ksu_ver }}`)
+          - **Hook 模式**：`CONFIG_KSU_TAMPER_SYSCALL_TABLE=y` + `CONFIG_KSU_LSM_SECURITY_HOOKS=y`（专用于 3.0~4.14 非 GKI，无需 Kprobes）
+          - **配套管理器**：`com.sukisu.nova`（SukiSU-Nova 官方管理器）
+          - **关键配置**：已启用 `CONFIG_KALLSYMS_ALL=y`、`CONFIG_KSU_FEATURE_ADBROOT=y`、内置 `mount_hide` / `selinux_hide` / `avc_spoof` / `kernel_umount` / 音量键三连安全模式
 
-          > 推荐用 \`Image.gz\` 替换原厂 \`boot.img\` 中的 kernel 重打包后，通过 Fastboot 刷入当前激活槽位（先用 \`fastboot getvar current-slot\` 确认是 \`a\` 还是 \`b\`）。
+          > 推荐用 `Image.gz` 替换原厂 `boot.img` 中的 kernel 重打包后，通过 Fastboot 刷入当前激活槽位（先用 `fastboot getvar current-slot` 确认是 `a` 还是 `b`）。
           EOF
 
           gh release create "$TAG" \
