@@ -93,7 +93,7 @@ jobs:
         working-directory: kernel_src
         run: |
           rm -rf KernelSU drivers/kernelsu
-          git clone --single-branch -b "${SUKISU_BRANCH}" "${SUKISU_REPO}" KernelSU
+          git clone --depth=50 --single-branch -b "${SUKISU_BRANCH}" "${SUKISU_REPO}" KernelSU
           KSU_SHA=$(git -C KernelSU rev-parse --short=8 HEAD)
           echo "ksu_ver=builtin-new-${KSU_SHA}" >> "$GITHUB_OUTPUT"
           echo "Cloned SukiSU-Nova (${SUKISU_BRANCH}) @ ${KSU_SHA}"
@@ -143,6 +143,7 @@ jobs:
           PY
 
       - name: 7. 生成 .config 并核对 SukiSU-Nova 配置生效
+        shell: bash
         working-directory: kernel_src
         run: |
           CLANG_DIR="${{ github.workspace }}/proton-clang/bin"
@@ -155,7 +156,6 @@ jobs:
             CROSS_COMPILE="${CLANG_DIR}/aarch64-linux-gnu-" \
             CROSS_COMPILE_ARM32="${CLANG_DIR}/arm-linux-gnueabi-" \
             LD="${CLANG_DIR}/ld.lld" \
-            AS="${CLANG_DIR}/llvm-as" \
             AR="${CLANG_DIR}/llvm-ar" \
             NM="${CLANG_DIR}/llvm-nm" \
             OBJCOPY="${CLANG_DIR}/llvm-objcopy" \
@@ -175,6 +175,7 @@ jobs:
           grep -q "^CONFIG_KALLSYMS_ALL=y$" "${OUT_DIR}/.config"
 
       - name: 8. 编译内核 (4.14.186 + SukiSU-Nova)
+        shell: bash
         working-directory: kernel_src
         env:
           KBUILD_BUILD_USER: builder
@@ -183,14 +184,9 @@ jobs:
           KBUILD_BUILD_VERSION: "1"
         run: |
           CLANG_DIR="${{ github.workspace }}/proton-clang/bin"
-          if [ "${{ github.event_name == 'push' || inputs.ccache_enabled }}" = "true" ]; then
-            ccache -o compression=false -o cache_dir=/root/.ccache -M 4G
-            CC_CMD="ccache ${CLANG_DIR}/clang"
-          else
-            CC_CMD="${CLANG_DIR}/clang"
-          fi
+          CC_CMD="${CLANG_DIR}/clang"
 
-          set +e
+          MAKE_RC=0
           PATH="${CLANG_DIR}:${PATH}" make -j"$(nproc)" \
             O="${OUT_DIR}" \
             ARCH="${ARCH}" \
@@ -199,7 +195,6 @@ jobs:
             CROSS_COMPILE="${CLANG_DIR}/aarch64-linux-gnu-" \
             CROSS_COMPILE_ARM32="${CLANG_DIR}/arm-linux-gnueabi-" \
             LD="${CLANG_DIR}/ld.lld" \
-            AS="${CLANG_DIR}/llvm-as" \
             AR="${CLANG_DIR}/llvm-ar" \
             NM="${CLANG_DIR}/llvm-nm" \
             OBJCOPY="${CLANG_DIR}/llvm-objcopy" \
@@ -210,17 +205,18 @@ jobs:
             LDGOLD="${CLANG_DIR}/aarch64-linux-gnu-ld.gold" \
             LLVM_AR="${CLANG_DIR}/llvm-ar" \
             LLVM_DIS="${CLANG_DIR}/llvm-dis" \
-            CONFIG_NO_ERROR_ON_MISMATCH=y 2>&1 | tee build.log
-          MAKE_RC=${PIPESTATUS[0]}
-          set -e
+            CONFIG_NO_ERROR_ON_MISMATCH=y > build.log 2>&1 || MAKE_RC=$?
+
+          tail -n 120 build.log
           if [ "$MAKE_RC" -ne 0 ]; then
-            echo "=== Build failed (rc=$MAKE_RC), emitting error summary ==="
-            grep -iE "error:|fatal error:|undefined reference|ld\.lld:|No such file|Stop\." build.log | tail -n 15 | while IFS= read -r line; do
-              echo "::error::${line}"
-            done
-            tail -n 10 build.log | while IFS= read -r line; do
-              echo "::warning::${line}"
-            done
+            {
+              echo "### Build Failed (exit code $MAKE_RC)"
+              echo '```text'
+              grep -iE "error:|fatal error:|undefined reference|ld\.lld:|No such file|Stop\." build.log | tail -n 50 || true
+              echo "--- LAST 50 LINES ---"
+              tail -n 50 build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit "$MAKE_RC"
           fi
 
